@@ -1,11 +1,15 @@
-# src/data/preprocess.py
+#!/usr/bin/env python3
 import os
+import sys
+
+# Ensure the parent 'src' directory is on sys.path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import json
 import numpy as np
 import pandas as pd
-from config import RAW_DIR, PROC_DIR
-from data.utils import save_memmap
-from data.utils import get_macd, ewma_vol
+from config import RAW_DIR, PROC_DIR, CTX_LEN, REGIMES_FILE
+from data.utils import save_memmap, get_macd, ewma_vol
 from ruptures import Pelt
 
 def segment_regimes(close, pen=5):
@@ -33,24 +37,24 @@ def compute_features(df):
     macd = get_macd(close, span_short=12, span_long=26)
     # 3) EWMA volatility (60 days)
     vol = ewma_vol(r1, span=60).clip(lower=1e-4)
-    # stack horizontally
+    # stack horizontally: shape [T, 7]
     feats = np.vstack([r1, r21, r63, r126, r252, macd, vol]).T
     return feats, r1.values
 
 def load_and_resample(ticker):
     """Load raw intraday CSV, resample to daily OHLCV."""
     path = os.path.join(RAW_DIR, f"{ticker}.csv")
-    df = (pd.read_csv(path, parse_dates=["Date and Time"])
-            .sort_values("Date and Time"))
-    df["Date"] = df["Date and Time"].dt.floor("D")
+    df = (pd.read_csv(path, parse_dates=["Date"])
+            .sort_values("Date"))
+    df["Date"] = df["Date"].dt.floor("D")  # normalize to date only
     daily = (df.groupby("Date")
                .agg({
-                 "Open": "first",
-                 "High": "max",
-                 "Low": "min",
-                 "Close": "last",
-                 "Volume": "sum",
-                 "Tick Count": "sum"
+                   "Open":      "first",
+                   "High":      "max",
+                   "Low":       "min",
+                   "Close":     "last",
+                   "Volume":    "sum",
+                   "Tick Count":"sum"
                })
                .reset_index()
             )
@@ -59,26 +63,39 @@ def load_and_resample(ticker):
 def main():
     os.makedirs(PROC_DIR, exist_ok=True)
     all_regs = {}
+
     for fn in os.listdir(RAW_DIR):
         if not fn.endswith(".csv"):
             continue
-        ticker = fn[:-4]
+        ticker = fn[:-4]  # remove '.csv' suffix
+        print(f"Processing {ticker}...")
+
         # 1) load & convert to daily bars
         daily = load_and_resample(ticker)
+
         # 2) compute features & next-day returns
         feats, rets = compute_features(daily)
-        # 3) save as memmap
-        save_memmap(os.path.join(PROC_DIR, f"{ticker}_feat.npy"), feats)
-        save_memmap(os.path.join(PROC_DIR, f"{ticker}_ret.npy"),  rets)
+
+        # 3) save as memmaps (cast to float32)
+        feat_path = os.path.join(PROC_DIR, f"{ticker}_feat.npy")
+        ret_path  = os.path.join(PROC_DIR, f"{ticker}_ret.npy")
+        save_memmap(feat_path, feats.astype(np.float32))
+        save_memmap(ret_path,  rets.astype(np.float32))
+
         # 4) detect regimes on daily close
         regs = segment_regimes(daily["Close"])
-        # clip each regime to CTX_LEN days
-        regs = [(max(0, s), min(e, s + CTX_LEN)) for s, e in regs]
-        all_regs[ticker] = regs
-        print(f"{ticker}: {len(regs)} regimes found")
+        # clip each regime to at most CTX_LEN days
+        clipped = []
+        for s, e in regs:
+            end = min(e, s + CTX_LEN)
+            clipped.append((s, end))
+        all_regs[ticker] = clipped
+        print(f"  → {len(clipped)} regimes found")
+
     # dump all regimes
     with open(REGIMES_FILE, "w") as f:
-        json.dump(all_regs, f)
+        json.dump(all_regs, f, indent=2)
+    print("All regimes saved to", REGIMES_FILE)
 
 if __name__ == "__main__":
     main()

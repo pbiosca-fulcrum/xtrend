@@ -3,7 +3,7 @@ import os
 import torch
 
 # data paths
-RAW_DIR      = os.path.expanduser("data/raw")
+RAW_DIR      = os.path.expanduser("data/2025-05-01")  # Updated to your specific directory
 PROC_DIR     = os.path.expanduser("data/processed")
 REGIMES_FILE = os.path.join(PROC_DIR, "regimes.json")
 

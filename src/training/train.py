@@ -1,4 +1,10 @@
+#!/usr/bin/env python3
 import os
+import sys
+
+# Ensure the top-level 'src' folder is on Python’s import path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import json
 import torch
 import random
@@ -16,99 +22,134 @@ from models.dmn import DMN
 
 class EpisodicDataset(Dataset):
     def __init__(self, setting="fewshot"):
-        self.tickers = all_tickers()
-        with open(REGIMES_FILE,"r") as f:
+        # only keep tickers with enough history for lookback
+        all_tks = all_tickers()
+        valid_tks = []
+        for tk in all_tks:
+            ds = AssetDataset(tk)
+            if ds.length > LT:
+                valid_tks.append(tk)
+        self.tickers = valid_tks
+        with open(REGIMES_FILE, "r") as f:
             self.regimes = json.load(f)
         self.setting = setting
 
     def __len__(self):
-        return len(self.tickers) * 100  # arbitrary
+        return len(self.tickers) * 100  # arbitrary episodes per ticker
 
     def __getitem__(self, idx):
         # pick random ticker
         tk = random.choice(self.tickers)
         ds = AssetDataset(tk)
         T = ds.length
-        # sample target end t in [LT .. T-1]
-        t_end = random.randint(LT, T-1)
-        # get target window
-        tgt_feat = ds.features[t_end-LT:t_end]
-        # pick contexts
-        regs = self.regimes[tk]
+
+        # sample a valid endpoint for the target window
+        t_end = random.randint(LT, T - 1)
+
+        # target feature window [t_end - LT, t_end)
+        tgt_feat = ds.features[t_end - LT : t_end]
+
+        # filter regimes that end before t_end
+        valid_regs = [(s, e) for (s, e) in self.regimes[tk] if e < t_end]
+        if not valid_regs:
+            # fallback: last CTX_LEN days
+            picks = [(t_end - CTX_LEN, t_end)] * CTX_SIZE
+        else:
+            # sample contexts with replacement
+            picks = random.choices(valid_regs, k=CTX_SIZE)
+
+        # build context windows
         ctx_samples = []
-        for _ in range(CTX_SIZE):
-            # choose random (s,e) with e < t_end
-            cand = random.choice(regs)
-            if cand[1] >= t_end: continue
-            ctx = ds.features[cand[0]:cand[1]]
-            # pad/truncate to CTX_LEN
-            if len(ctx) >= CTX_LEN:
-                ctx = ctx[:CTX_LEN]
-            else:
-                pad = np.zeros((CTX_LEN-len(ctx), ctx.shape[1]))
+        for (s, e) in picks:
+            ctx = ds.features[s:e]
+            # pad or truncate to CTX_LEN
+            if len(ctx) < CTX_LEN:
+                pad = np.zeros((CTX_LEN - len(ctx), ctx.shape[1]), dtype=np.float32)
                 ctx = np.vstack([pad, ctx])
+            else:
+                ctx = ctx[:CTX_LEN]
             ctx_samples.append(ctx)
-        ctx_arr = np.stack(ctx_samples, axis=0)  # [C, Lc, D]
-        return (tgt_feat.astype(np.float32),
-                ctx_arr.astype(np.float32),
-                ds.returns[t_end])  # next-day return
+
+        # stack into [CTX_SIZE, CTX_LEN, feat_dim]
+        ctx_arr = np.stack(ctx_samples, axis=0)
+        ret = ds.returns[t_end]
+        return (
+            tgt_feat.astype(np.float32),
+            ctx_arr.astype(np.float32),
+            np.float32(ret),
+        )
+
 
 def collate_fn(batch):
     tgts, ctxs, rets = zip(*batch)
-    return (torch.tensor(np.stack(tgts)),
-            torch.tensor(np.stack(ctxs)),
-            torch.tensor(rets))
+    return (
+        torch.from_numpy(np.stack(tgts, axis=0)),
+        torch.from_numpy(np.stack(ctxs, axis=0)),
+        torch.from_numpy(np.stack(rets, axis=0)),
+    )
+
 
 def main(args):
     torch.manual_seed(SEED)
-    # dataset & loader
-    ds = EpisodicDataset(setting=args.setting)
-    dl = DataLoader(ds, batch_size=args.batch_size,
-                    shuffle=True, collate_fn=collate_fn,
-                    num_workers=0, drop_last=True)
+    random.seed(SEED)
+    np.random.seed(SEED)
 
-    # model
-    if args.setting=="baseline":
+    # prepare data
+    ds = EpisodicDataset(setting=args.setting)
+    dl = DataLoader(
+        ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
+        drop_last=True,
+        num_workers=0
+    )
+
+    # instantiate model
+    if args.setting == "baseline":
         model = DMN(input_dim=7, hidden_dim=HID_DIM)
     else:
         model = XTrend(feat_dim=7, hid_dim=HID_DIM, ctx_size=CTX_SIZE)
     model.to(DEVICE)
-    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    for ep in range(args.epochs):
-        losses = []
-        pnl = []
-        for x_tgt, x_ctx, ret in tqdm(dl, desc=f"Epoch {ep}"):
-            x_tgt, x_ctx, ret = x_tgt.to(DEVICE), x_ctx.to(DEVICE), ret.to(DEVICE)
-            opt.zero_grad()
+    # training loop
+    for ep in range(1, args.epochs + 1):
+        model.train()
+        losses, pnl_vals = [], []
+        for tgt_feat, ctx_arr, ret in tqdm(dl, desc=f"Epoch {ep}"):
+            tgt_feat = tgt_feat.to(DEVICE)
+            ctx_arr  = ctx_arr.to(DEVICE)
+            ret      = ret.to(DEVICE)
 
-            if args.setting=="baseline":
-                pos = model(x_tgt)
-                mu  = None; sd=None
+            optimizer.zero_grad()
+            if args.setting == "baseline":
+                pos = model(tgt_feat)
+                pnl = pos * ret
             else:
-                mu, sd, pos = model(x_tgt, x_ctx)
+                mu, sd, pos = model(tgt_feat, ctx_arr)
+                pnl = pos * ret / (sd + 1e-6)
 
-            # compute Sharpe loss: −mean( pos * ret / sd ) / std(...)
-            pnl_batch = (pos * ret / (sd+1e-6)).detach().cpu().numpy()
-            loss = - torch.mean( (pos*ret/sd) ) / (torch.std(pos*ret/sd)+1e-6)
+            loss = -torch.mean(pnl) / (torch.std(pnl) + 1e-6)
             loss.backward()
-            opt.step()
+            optimizer.step()
 
             losses.append(loss.item())
-            pnl.extend(pnl_batch.tolist())
+            pnl_vals.extend(pnl.detach().cpu().tolist())
 
-        print(f"Epoch {ep} — loss {np.mean(losses):.4f}  Sharpe {sharpe(pnl):.4f}")
-
-        # save checkpoint
+        print(f"Epoch {ep} — Loss: {np.mean(losses):.4f}, Sharpe: {sharpe(pnl_vals):.4f}")
         os.makedirs("checkpoints", exist_ok=True)
-        torch.save(model.state_dict(), f"checkpoints/xtrend_{args.setting}.pt")
+        ckpt = f"checkpoints/xtrend_{args.setting}.pt"
+        torch.save(model.state_dict(), ckpt)
 
-if __name__=="__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--setting", type=str, default="fewshot",
-                   choices=["fewshot","zeroshot","baseline"])
-    p.add_argument("--epochs",    type=int, default=EPOCHS)
-    p.add_argument("--batch_size",type=int, default=BATCH_SIZE)
-    p.add_argument("--lr",        type=float, default=LR)
-    args = p.parse_args()
+    print("Training complete. Last checkpoint:", ckpt)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--setting",    type=str,   default="fewshot", choices=["fewshot","zeroshot","baseline"])
+    parser.add_argument("--epochs",     type=int,   default=EPOCHS)
+    parser.add_argument("--batch_size", type=int,   default=BATCH_SIZE)
+    parser.add_argument("--lr",         type=float, default=LR)
+    args = parser.parse_args()
     main(args)
