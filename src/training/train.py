@@ -1,155 +1,180 @@
 #!/usr/bin/env python3
 import os
 import sys
-
-# Ensure the top-level 'src' folder is on Python’s import path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import json
-import torch
 import random
-import argparse
+import time
+
 import numpy as np
-from tqdm import tqdm
+import torch
 from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+
+# ensure top-level src/ on Python path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import *
 from data.loader import AssetDataset, all_tickers
 from utils.metrics import sharpe
-from utils.cpd import detect_change_points
-from models.xtrend import XTrend
 from models.dmn import DMN
+from models.xtrend import XTrend
 
 class EpisodicDataset(Dataset):
-    def __init__(self, setting="fewshot"):
-        # only keep tickers with enough history for lookback
-        all_tks = all_tickers()
-        valid_tks = []
-        for tk in all_tks:
-            ds = AssetDataset(tk)
-            if ds.length > LT:
-                valid_tks.append(tk)
-        self.tickers = valid_tks
-        with open(REGIMES_FILE, "r") as f:
-            self.regimes = json.load(f)
+    def __init__(self, tickers, regimes, setting):
+        self.tickers = tickers
+        self.regimes = regimes
         self.setting = setting
 
     def __len__(self):
-        return len(self.tickers) * 100  # arbitrary episodes per ticker
+        return len(self.tickers) * 100
 
     def __getitem__(self, idx):
-        # pick random ticker
         tk = random.choice(self.tickers)
         ds = AssetDataset(tk)
-        T = ds.length
-
-        # sample a valid endpoint for the target window
-        t_end = random.randint(LT, T - 1)
-
-        # target feature window [t_end - LT, t_end)
-        tgt_feat = ds.features[t_end - LT : t_end]
-
-        # filter regimes that end before t_end
-        valid_regs = [(s, e) for (s, e) in self.regimes[tk] if e < t_end]
-        if not valid_regs:
-            # fallback: last CTX_LEN days
-            picks = [(t_end - CTX_LEN, t_end)] * CTX_SIZE
-        else:
-            # sample contexts with replacement
-            picks = random.choices(valid_regs, k=CTX_SIZE)
-
-        # build context windows
-        ctx_samples = []
-        for (s, e) in picks:
-            ctx = ds.features[s:e]
-            # pad or truncate to CTX_LEN
-            if len(ctx) < CTX_LEN:
-                pad = np.zeros((CTX_LEN - len(ctx), ctx.shape[1]), dtype=np.float32)
-                ctx = np.vstack([pad, ctx])
+        t_end = random.randint(LT, ds.length - 1)
+        tgt = ds.features[t_end - LT : t_end]
+        regs = [(s, e) for (s, e) in self.regimes[tk] if e < t_end]
+        picks = random.choices(regs, k=CTX_SIZE) if regs else [(t_end-CTX_LEN, t_end)]*CTX_SIZE
+        ctxs = []
+        for s, e in picks:
+            arr = ds.features[s : min(e, s+CTX_LEN)]
+            if len(arr)<CTX_LEN:
+                pad = np.zeros((CTX_LEN - len(arr), arr.shape[1]),dtype=np.float32)
+                arr = np.vstack([pad, arr])
             else:
-                ctx = ctx[:CTX_LEN]
-            ctx_samples.append(ctx)
-
-        # stack into [CTX_SIZE, CTX_LEN, feat_dim]
-        ctx_arr = np.stack(ctx_samples, axis=0)
-        ret = ds.returns[t_end]
+                arr = arr[:CTX_LEN]
+            ctxs.append(arr)
         return (
-            tgt_feat.astype(np.float32),
-            ctx_arr.astype(np.float32),
-            np.float32(ret),
+            tgt.astype(np.float32),
+            np.stack(ctxs).astype(np.float32),
+            np.float32(ds.returns[t_end])
         )
-
 
 def collate_fn(batch):
     tgts, ctxs, rets = zip(*batch)
     return (
-        torch.from_numpy(np.stack(tgts, axis=0)),
-        torch.from_numpy(np.stack(ctxs, axis=0)),
-        torch.from_numpy(np.stack(rets, axis=0)),
+        torch.from_numpy(np.stack(tgts)),
+        torch.from_numpy(np.stack(ctxs)),
+        torch.from_numpy(np.stack(rets))
     )
-
 
 def main(args):
     torch.manual_seed(SEED)
     random.seed(SEED)
     np.random.seed(SEED)
 
-    # prepare data
-    ds = EpisodicDataset(setting=args.setting)
-    dl = DataLoader(
-        ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=collate_fn,
-        drop_last=True,
-        num_workers=0
-    )
+    with open(REGIMES_FILE) as f:
+        regimes = json.load(f)
 
-    # instantiate model
-    if args.setting == "baseline":
-        model = DMN(input_dim=7, hidden_dim=HID_DIM)
-    else:
-        model = XTrend(feat_dim=7, hid_dim=HID_DIM, ctx_size=CTX_SIZE)
+    all_tks = all_tickers()
+    valid = [tk for tk in all_tks if AssetDataset(tk).length > LT]
+    random.shuffle(valid)
+    split = int(len(valid)*(1-VAL_SPLIT))
+    train_tks, val_tks = valid[:split], valid[split:]
+    print(f"→ {len(train_tks)} train tickers, {len(val_tks)} val tickers")
+
+    ds_tr = EpisodicDataset(train_tks, regimes, args.setting)
+    ds_val= EpisodicDataset(val_tks,   regimes, args.setting)
+    dl_tr = DataLoader(ds_tr,  batch_size=args.batch_size, shuffle=True,
+                      collate_fn=collate_fn, drop_last=True)
+    dl_val= DataLoader(ds_val, batch_size=VAL_BATCH_SIZE, shuffle=False,
+                      collate_fn=collate_fn, drop_last=False)
+
+    model = DMN(input_dim=7, hidden_dim=HID_DIM) if args.setting=="baseline" \
+            else XTrend(feat_dim=7, hid_dim=HID_DIM, ctx_size=CTX_SIZE)
     model.to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    # training loop
-    for ep in range(1, args.epochs + 1):
+    best_val_sh = -float("inf")
+    for ep in range(1, args.epochs+1):
+        start_time = time.time()
         model.train()
-        losses, pnl_vals = [], []
-        for tgt_feat, ctx_arr, ret in tqdm(dl, desc=f"Epoch {ep}"):
-            tgt_feat = tgt_feat.to(DEVICE)
-            ctx_arr  = ctx_arr.to(DEVICE)
-            ret      = ret.to(DEVICE)
 
+        # accumulators
+        total_losses = []
+        nll_losses   = []
+        sharpe_losses= []
+        pnl_values   = []
+        pos_means    = []
+        grad_norms   = []
+
+        for tgt, ctx, ret in tqdm(dl_tr, desc=f"Epoch {ep} [Train]"):
+            tgt, ctx, ret = tgt.to(DEVICE), ctx.to(DEVICE), ret.to(DEVICE)
             optimizer.zero_grad()
-            if args.setting == "baseline":
-                pos = model(tgt_feat)
-                pnl = pos * ret
-            else:
-                mu, sd, pos = model(tgt_feat, ctx_arr)
-                pnl = pos * ret / (sd + 1e-6)
 
-            loss = -torch.mean(pnl) / (torch.std(pnl) + 1e-6)
+            if args.setting=="baseline":
+                pos = model(tgt)
+                pnl = pos * ret
+                loss = -pnl.mean() / (pnl.std()+1e-6)
+                nll, sl = torch.tensor(0.), loss.detach()
+            else:
+                mu, sd, pos = model(tgt, ctx)
+                # NLL
+                nll = 0.5*((ret-mu)**2)/(sd**2+1e-6) + torch.log(sd+1e-6)
+                nll = nll.mean()
+                # Sharpe loss
+                pnl = pos * ret / (sd+1e-6)
+                pnl_wu = pnl[LS:] if len(pnl)>LS else pnl
+                sl = -pnl_wu.mean() / (pnl_wu.std()+1e-6)
+                loss = nll + sl
+
             loss.backward()
+            # gradient norm
+            total_norm = torch.norm(torch.stack([p.grad.norm() for p in model.parameters()]))
+            grad_norms.append(total_norm.item())
             optimizer.step()
 
-            losses.append(loss.item())
-            pnl_vals.extend(pnl.detach().cpu().tolist())
+            total_losses.append(loss.item())
+            nll_losses.append(nll.item())
+            sharpe_losses.append(sl.item())
+            pnl_values.extend(pnl.detach().cpu().tolist())
+            pos_means.append(pos.detach().cpu().mean().item())
 
-        print(f"Epoch {ep} — Loss: {np.mean(losses):.4f}, Sharpe: {sharpe(pnl_vals):.4f}")
-        os.makedirs("checkpoints", exist_ok=True)
-        ckpt = f"checkpoints/xtrend_{args.setting}.pt"
-        torch.save(model.state_dict(), ckpt)
+        # epoch summaries
+        tr_sh = sharpe(pnl_values)
+        print(f"\nEpoch {ep} summary:")
+        print(f"  Duration:           {time.time()-start_time:.1f}s")
+        print(f"  Total loss:         {np.mean(total_losses):.4f} ± {np.std(total_losses):.4f}")
+        print(f"  NLL loss:           {np.mean(nll_losses):.4f} ± {np.std(nll_losses):.4f}")
+        print(f"  Sharpe loss:        {np.mean(sharpe_losses):.4f} ± {np.std(sharpe_losses):.4f}")
+        print(f"  PnL Sharpe:         {tr_sh:.4f}")
+        print(f"  Position mean/std:  {np.mean(pos_means):.4f} ± {np.std(pos_means):.4f}")
+        print(f"  Grad norm:          {np.mean(grad_norms):.4f} ± {np.std(grad_norms):.4f}")
 
-    print("Training complete. Last checkpoint:", ckpt)
+        # validation
+        model.eval()
+        val_pnls = []
+        with torch.no_grad():
+            for tgt, ctx, ret in tqdm(dl_val, desc=f"Epoch {ep} [Val]"):
+                tgt, ctx, ret = tgt.to(DEVICE), ctx.to(DEVICE), ret.to(DEVICE)
+                if args.setting=="baseline":
+                    pos = model(tgt); pnl = pos*ret
+                else:
+                    mu, sd, pos = model(tgt, ctx)
+                    pnl = pos*ret/(sd+1e-6)
+                val_pnls.extend(pnl.cpu().tolist())
+
+        val_sh = sharpe(val_pnls)
+        print(f"  Validation Sharpe:  {val_sh:.4f}\n")
+
+        # checkpoint
+        ckpt = f"checkpoints/{args.setting}.pt"
+        if val_sh > best_val_sh:
+            best_val_sh = val_sh
+            torch.save(model.state_dict(), ckpt)
+            print(f"  → New best model saved to {ckpt}\n")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--setting",    type=str,   default="fewshot", choices=["fewshot","zeroshot","baseline"])
-    parser.add_argument("--epochs",     type=int,   default=EPOCHS)
-    parser.add_argument("--batch_size", type=int,   default=BATCH_SIZE)
-    parser.add_argument("--lr",         type=float, default=LR)
-    args = parser.parse_args()
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--setting",   type=str, required=True,
+                   choices=["baseline","fewshot","zeroshot"])
+    p.add_argument("--lr",        type=float, default=LR)
+    p.add_argument("--batch_size",type=int,   default=BATCH_SIZE)
+    p.add_argument("--epochs",    type=int,   default=EPOCHS)
+    args = p.parse_args()
+
     main(args)
+    
+    
