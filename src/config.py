@@ -18,6 +18,10 @@ EPOCHS       = 20
 DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
 SEED         = 42
 
+# traditional EWMA-difference strategy parameters
+EWMA_SHORT   = 9       # span for short EWMA
+EWMA_LONG    = 65      # span for long  EWMA
+
 # validation split (hold-out)
 VAL_SPLIT      = 0.2   # fraction of tickers held for validation
 VAL_BATCH_SIZE = 32    # batch size for validation loader
